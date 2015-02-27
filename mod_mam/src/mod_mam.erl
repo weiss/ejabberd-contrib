@@ -944,7 +944,7 @@ query_archive(#mam_query{mam_jid = {U, S}, max = Max} = Query) ->
 
 query_archive(Query,
 	      #mam_query_state{n_remaining = ToDo, current = ID} = QueryState,
-	      #mam_meta{first_id = FirstID, last_id = LastID} = Meta, DBType)
+	      #mam_meta{first_id = FirstID, last_id = LastID} = Meta, _DBType)
     when ToDo =:= 0;
 	 ID =:= undefined;
 	 ID < FirstID;
@@ -954,8 +954,7 @@ query_archive(Query,
 		index = resulting_index(Query, QueryState, Meta),
 		first = resulting_first(Query, QueryState),
 		last = resulting_last(Query, QueryState),
-		is_complete = result_is_complete(Query, QueryState, Meta,
-						 DBType)};
+		is_complete = result_is_complete(Query, QueryState, Meta)};
 query_archive(#mam_query{mam_jid = {U, S},
 			 direction = Direction,
 			 filter = Filter} = Query,
@@ -976,13 +975,10 @@ query_archive(#mam_query{mam_jid = {U, S},
 					       messages = [Msg | Msgs]}
 	      end,
 	  query_next(Query, NewQueryState, Meta, N - 1, DBType);
-      drop ->
-	  query_next(Query, QueryState, Meta, N, DBType);
       stop ->
 	  query_next(Query, QueryState, Meta, 0, DBType);
-      not_found ->
-	  ?DEBUG("MAM message ~B of ~s@~s not found", [ID, U, S]),
-	  query_next(Query, QueryState, Meta, N - 1, DBType)
+      _DropOrNotFound ->
+	  query_next(Query, QueryState, Meta, N, DBType)
     end.
 
 -spec query_next(mam_query(), mam_query_state(), mam_meta(),
@@ -1026,7 +1022,9 @@ read_message(Key, Filter, Direction, mnesia) ->
 		?DEBUG("Message ~p filtered: ~s", [Msg, DropOrStop]),
 		DropOrStop
 	  end;
-      [] -> not_found
+      [] ->
+	  ?DEBUG("Message ~p not found", [Key]),
+	  not_found
     end.
 
 -spec filter_message(mam_msg(), mam_filter(), direction())
@@ -1115,29 +1113,16 @@ filter_message_with(full,
 filter_message_with(full, _Msg, _Filter) ->
     drop.
 
--spec another_message_exists(mam_query(), mam_msg_id(), db_type()) -> boolean().
+-spec another_message_exists(mam_query(), mam_msg_id()) -> boolean().
 
-another_message_exists(#mam_query{mam_jid = {U, S},
-				  direction = Direction,
-				  filter = Filter} = Query, ID, DBType) ->
-    case read_message({{U, S}, ID}, Filter, Direction, DBType) of
-      #mam_msg{} ->
-	  ?DEBUG("Found another message for ~s@~s: ~B", [U, S, ID]),
-	  true;
-      not_found ->
+another_message_exists(#mam_query{mam_jid = {U, S}} = Query, ID) ->
+    case query_archive(Query#mam_query{id = ID, max = 1}) of
+      #mam_result{messages = []} ->
 	  ?DEBUG("Found no other message for ~s@~s: ~B", [U, S, ID]),
 	  false;
-      stop ->
-	  ?DEBUG("Found no other unfiltered message for ~s@~s: ~B", [U, S, ID]),
-	  false;
-      drop ->
-	  NextID = case Direction of
-		     before ->
-			 ID - 1;
-		     aft ->
-			 ID + 1
-		   end,
-	  another_message_exists(Query, NextID, DBType)
+      #mam_result{} ->
+	  ?DEBUG("Found another message for ~s@~s: ~B", [U, S, ID]),
+	  true
     end.
 
 %%--------------------------------------------------------------------
@@ -1202,21 +1187,21 @@ resulting_last(#mam_query{direction = aft},
 	       #mam_query_state{last = Last}) ->
     Last.
 
--spec result_is_complete(mam_query(), mam_query_state(), mam_meta(), db_type())
+-spec result_is_complete(mam_query(), mam_query_state(), mam_meta())
       -> boolean().
 
 result_is_complete(#mam_query{filter = Filter} = Query,
 		   #mam_query_state{current = ID},
-		   _Meta, DBType)
+		   _Meta)
     when Filter =/= #mam_filter{}, ID =/= undefined ->
-    not another_message_exists(Query, ID, DBType);
+    not another_message_exists(Query, ID);
 result_is_complete(#mam_query{direction = before},
 		   #mam_query_state{first = First},
-		   #mam_meta{first_id = FirstID}, _DBType) ->
+		   #mam_meta{first_id = FirstID}) ->
     First =:= FirstID;
 result_is_complete(#mam_query{direction = aft},
 		   #mam_query_state{last = Last},
-		   #mam_meta{last_id = LastID}, _DBType) ->
+		   #mam_meta{last_id = LastID}) ->
     Last =:= LastID.
 
 %%--------------------------------------------------------------------
