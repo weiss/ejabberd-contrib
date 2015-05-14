@@ -27,6 +27,8 @@
 -author('holger@zedat.fu-berlin.de').
 
 -define(NS_MAM, <<"urn:xmpp:mam:0">>).
+-define(NS_MAM_SUB, <<"urn:xmpp:mam:sub:0">>).
+-define(NS_MID, <<"urn:xmpp:mid:0">>).
 -define(PROCNAME, ?MODULE).
 -define(GEN_SERVER, gen_server).
 -define(DEFAULT_MAX_MESSAGES, infinity).
@@ -55,8 +57,9 @@
 	 send_stanza/3,
 	 remove_user/2]).
 
-%% gen_iq_handler callback.
--export([handle_iq/3]).
+%% gen_iq_handler callbacks.
+-export([handle_mam_iq/3,
+	 handle_mam_sub_iq/3]).
 
 %% Spawned processes.
 -export([maybe_change_mnesia_fragment_count/2]).
@@ -114,6 +117,10 @@
 	{default                :: pos_integer(),
 	 max                    :: pos_integer()}).
 
+-record(mam_subscriber,
+	{us                     :: {binary(), binary()},
+	 resource               :: binary()}).
+
 -record(state,
 	{host                           :: binary(),
 	 access_max_messages            :: atom(),
@@ -153,15 +160,24 @@ start_link(Host, Opts) ->
 
 start(Host, Opts) ->
     %% Set up processing of MAM requests.
-    IQDisc = gen_mod:get_opt(iqdisc, Opts,
-			     fun gen_iq_handler:check_type/1,
-			     parallel),
+    IQDisc1 = gen_mod:get_opt(iqdisc, Opts,
+			      fun gen_iq_handler:check_type/1,
+			      parallel),
     gen_iq_handler:add_iq_handler(ejabberd_sm, Host, ?NS_MAM, ?MODULE,
-				  handle_iq, IQDisc),
+				  handle_mam_iq, IQDisc1),
+    %% Set up processing of MAM SUB requests.
+    IQDisc2 = gen_mod:get_opt(iqdisc, Opts,
+			      fun gen_iq_handler:check_type/1,
+			      one_queue),
+    gen_iq_handler:add_iq_handler(ejabberd_sm, Host, ?NS_MAM_SUB, ?MODULE,
+				  handle_mam_sub_iq, IQDisc2),
     %% Set up MAM feature announcement.
     mod_disco:register_feature(Host, ?NS_MAM),
     ejabberd_hooks:add(disco_sm_features, Host, ?MODULE, disco_features, 50),
-    %% Set up message storage process.
+    %% Set up MAM SUB feature announcement.
+    mod_disco:register_feature(Host, ?NS_MAM_SUB),
+    ejabberd_hooks:add(disco_sm_features, Host, ?MODULE, disco_features, 50),
+    %% Set up message storage/delivery process.
     Proc = gen_mod:get_module_proc(Host, ?PROCNAME),
     Spec = {Proc, {?MODULE, start_link, [Host, Opts]}, permanent, 3000, worker,
 	    [?MODULE]},
@@ -198,6 +214,11 @@ init({Host, Opts}) ->
 			       {attributes, record_info(fields, mam_meta)}]);
       _ -> ok
     end,
+    mnesia:create_table(mam_subscriber,
+			[{ram_copies, [node()]},
+			 {attributes, record_info(fields, mam_subscriber)},
+			 {type, bag}]),
+    mnesia:add_table_copy(mam_subscriber, node(), ram_copies),
     ejabberd_hooks:add(user_receive_packet, Host, ?MODULE,
 		       receive_stanza, 50),
     ejabberd_hooks:add(user_send_packet, Host, ?MODULE,
@@ -251,7 +272,8 @@ terminate(Reason, #state{host = Host}) ->
     ejabberd_hooks:delete(remove_user, Host, ?MODULE,
 			  remove_user, 50),
     ejabberd_hooks:delete(anonymous_purge_hook, Host, ?MODULE,
-			  remove_user, 50).
+			  remove_user, 50),
+    mnesia:del_table_copy(mam_subscriber, node()).
 
 -spec code_change({down, _} | _, state(), _) -> {ok, state()}.
 
@@ -271,7 +293,7 @@ disco_features(empty, From, To, Node, Lang) ->
 disco_features({result, OtherFeatures},
 	       #jid{luser = U, lserver = S},
 	       #jid{luser = U, lserver = S}, <<"">>, _Lang) ->
-    {result, OtherFeatures ++ [?NS_MAM]};
+    {result, OtherFeatures ++ [?NS_MAM, ?NS_MAM_SUB]};
 disco_features(Acc, _From, _To, _Node, _Lang) -> Acc.
 
 -spec receive_stanza(jid(), jid(), jid(), xmlel()) -> ok.
@@ -414,7 +436,8 @@ is_resent(El) ->
 
 maybe_store_message(#state{host = Host} = State, US, Msg) ->
     DBType = gen_mod:db_type(Host, ?MODULE),
-    maybe_store_message(State, US, Msg, DBType).
+    maybe_store_message(State, US, Msg, DBType),
+    send_to_subscribers(US, Msg).
 
 -spec maybe_store_message(state(), mam_jid(), mam_msg(), db_type()) -> ok.
 
@@ -508,6 +531,43 @@ get_max_messages(AccessRule, {U, S}, Host) ->
     end.
 
 %%--------------------------------------------------------------------
+%% Send message to subscribers.
+%%--------------------------------------------------------------------
+
+-spec send_to_subscribers({binary(), binary()}, mam_msg()) -> ok.
+
+send_to_subscribers(US, Msg) ->
+    lists:foreach(fun(#mam_subscriber{us = {U, S}, resource = R}) ->
+			  send_to_subscriber(U, S, R, Msg)
+		  end, mnesia:dirty_read(mam_subscriber, US)).
+
+-spec send_to_subscriber(binary(), binary(), binary(), mam_msg()) -> ok.
+
+send_to_subscriber(U, S, R, #mam_msg{key = {_US, MamID}, stanza = Stanza}) ->
+    ID = jlib:encode_base64(crypto:rand_bytes(9)),
+    To = jlib:jid_to_string({U, S, R}),
+    NoCopy = #xmlel{name = <<"no-copy">>,
+		    attrs = [{<<"xmlns">>, ?NS_HINTS}]},
+    MessageId = #xmlel{name = <<"message-id">>,
+		       attrs = [{<<"xmlns">>, ?NS_MID},
+				{<<"id">>, jlib:integer_to_binary(MamID)}]},
+    Forwarded = #xmlel{name = <<"forwarded">>,
+		       attrs = [{<<"xmlns">>, ?NS_FORWARD}],
+		       children = [xml:replace_tag_attr(<<"xmlns">>,
+							<<"jabber:client">>,
+							Stanza)]},
+    MamSub = #xmlel{name = <<"mamsub">>,
+		    attrs = [{<<"xmlns">>, ?NS_MAM_SUB}],
+		    children = [MessageId, Forwarded]},
+    Message = #xmlel{name = <<"message">>,
+		     attrs = [{<<"id">>, ID}, {<<"to">>, To}],
+		     children = [MamSub, NoCopy]},
+    ?DEBUG("Sending MAM SUB message ~B to ~s", [MamID, To]),
+    ejabberd_router:route(jlib:make_jid(U, S, <<"">>),
+			  jlib:make_jid(U, S, R),
+			  Message).
+
+%%--------------------------------------------------------------------
 %% Manage Mnesia fragments.
 %%--------------------------------------------------------------------
 
@@ -595,27 +655,27 @@ change_mnesia_fragment_count(del, Number) ->
     lists:foreach(DelFrag, lists:seq(1, Number)).
 
 %%--------------------------------------------------------------------
-%% Handle IQ requests.
+%% Handle MAM IQ requests.
 %%--------------------------------------------------------------------
 
--spec handle_iq(jid(), jid(), iq_request()) -> iq_reply().
+-spec handle_mam_iq(jid(), jid(), iq_request()) -> iq_reply().
 
-handle_iq(#jid{luser = U, lserver = S},
-	  #jid{luser = U, lserver = S},
-	  #iq{type = get, sub_el = #xmlel{name = <<"query">>}} = IQ) ->
+handle_mam_iq(#jid{luser = U, lserver = S},
+	      #jid{luser = U, lserver = S},
+	      #iq{type = get, sub_el = #xmlel{name = <<"query">>}} = IQ) ->
     ?DEBUG("Got MAM form request from ~s@~s", [U, S]),
     handle_form_request(IQ);
-handle_iq(#jid{luser = U, lserver = S} = From,
-	  #jid{luser = U, lserver = S},
-	  #iq{type = set, sub_el = #xmlel{name = <<"query">>}} = IQ) ->
+handle_mam_iq(#jid{luser = U, lserver = S} = From,
+	      #jid{luser = U, lserver = S},
+	      #iq{type = set, sub_el = #xmlel{name = <<"query">>}} = IQ) ->
     ?DEBUG("Got MAM archive request from ~s@~s", [U, S]),
     handle_archive_request(From, IQ);
-handle_iq(#jid{luser = U, lserver = S}, #jid{luser = U, lserver = S},
-	  #iq{sub_el = #xmlel{name = <<"prefs">>} = SubEl} = IQ) ->
+handle_mam_iq(#jid{luser = U, lserver = S}, #jid{luser = U, lserver = S},
+	      #iq{sub_el = #xmlel{name = <<"prefs">>} = SubEl} = IQ) ->
     ?DEBUG("Refusing MAM preferences request from ~s@~s (not implemented)",
 	   [U, S]),
     IQ#iq{type = error, sub_el = [SubEl, ?ERR_FEATURE_NOT_IMPLEMENTED]};
-handle_iq(From, To, #iq{sub_el = SubEl} = IQ) ->
+handle_mam_iq(From, To, #iq{sub_el = SubEl} = IQ) ->
     ?DEBUG("Refusing MAM request from ~s to ~s (forbidden)",
 	   [jlib:jid_to_string(From), jlib:jid_to_string(To)]),
     IQ#iq{type = error, sub_el = [SubEl, ?ERR_FORBIDDEN]}.
@@ -664,6 +724,31 @@ handle_archive_request(#jid{luser = U, lserver = S} = JID,
 		 [jlib:jid_to_string(JID), Error]),
 	  IQ#iq{type = error, sub_el = [SubEl, Error]}
     end.
+
+%%--------------------------------------------------------------------
+%% Handle MAM SUB IQ requests.
+%%--------------------------------------------------------------------
+
+-spec handle_mam_sub_iq(jid(), jid(), iq_request()) -> iq_reply().
+
+handle_mam_sub_iq(#jid{luser = U, lserver = S, lresource = R},
+		  #jid{luser = U, lserver = S},
+		  #iq{type = set,
+		      sub_el = #xmlel{name = <<"subscribe">>}} = IQ) ->
+    ?DEBUG("Got MAM subscription request from ~s@~s/~s", [U, S, R]),
+    mnesia:dirty_write(#mam_subscriber{us = {U, S}, resource = R}),
+    IQ#iq{type = result, sub_el = []};
+handle_mam_sub_iq(#jid{luser = U, lserver = S, lresource = R},
+		  #jid{luser = U, lserver = S},
+		  #iq{type = set,
+		      sub_el = #xmlel{name = <<"unsubscribe">>}} = IQ) ->
+    ?DEBUG("Got MAM unsubscription request from ~s@~s/~s", [U, S, R]),
+    mnesia:dirty_delete_object(#mam_subscriber{us = {U, S}, resource = R}),
+    IQ#iq{type = result, sub_el = []};
+handle_mam_sub_iq(From, To, #iq{sub_el = SubEl} = IQ) ->
+    ?DEBUG("Refusing MAM SUB request from ~s to ~s (forbidden)",
+	   [jlib:jid_to_string(From), jlib:jid_to_string(To)]),
+    IQ#iq{type = error, sub_el = [SubEl, ?ERR_FORBIDDEN]}.
 
 %%--------------------------------------------------------------------
 %% Parse request.
